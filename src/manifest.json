@@ -24,6 +24,7 @@
       "run_at": "document_idle"
     }
   ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtk0Il3jbdlywPFKeGCoNurNBVQwc/xA5jmqksL49f0RmxZwedBKhYK9I0Pf8AJGIB7Wdl8fcUMrXnEoO2HvEcCV0flArOSxsFwF5PftoNNzZ1PH74AI4Mm2uG8D4PALWe5WI3HHGFhVfPOkE9tz6VCS0RHYhqOC5mQWDMaIhKLfdZz/z3eNZ9GXkfNremh86YfGZ4+c50xwyYq7n0EF3nDfzt+LqFwTfOBlmiV5HnRT/JiyTDR8dcsES0uQ1Vqa8YbkL1QqPkek3Vl8vsqafHlYwcAsFmosCcOG5sydQvtpX6rzoQ4g0c3IMkkwRb0SCDHLXcAx7qcEe3SPEW9CMfQIDAQAB",
   "host_permissions": [
     "<all_urls>"
   ],
