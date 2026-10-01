@@ -1,0 +1,264 @@
+         return { name, keyPath: idx.keyPath, multiEntry: idx.multiEntry, unique: idx.unique };
+              });
+              await new Promise((resolve, reject) => {
+                const req = store.openCursor();
+                let count = 0;
+                let chars = 0;
+                req.onerror = () => reject(req.error || new Error("Cursor failed"));
+                req.onsuccess = () => {
+                  const cursor = req.result;
+                  if (!cursor) { resolve(); return; }
+                  if (count >= 1000 || chars >= 4000000) { storeItem.truncated = true; resolve(); return; }
+                  let row;
+                  try { row = { key: toJsonSafe(cursor.key), primaryKey: toJsonSafe(cursor.primaryKey), value: toJsonSafe(cursor.value) }; }
+                  catch (error) { row = { key: String(cursor.key), value: `[unserializable: ${error?.message || String(error)}]` }; }
+                  const text = JSON.stringify(row);
+                  chars += text.length;
+                  if (chars > 4000000) { storeItem.truncated = true; resolve(); return; }
+                  storeItem.records.push(row);
+                  count += 1;
+                  cursor.continue();
+                };
+              });
+            } catch (error) {
+              storeItem.error = error?.message || String(error);
+            }
+            dbItem.stores.push(storeItem);
+          }
+          db.close();
+        } catch (error) {
+          dbItem.error = error?.message || String(error);
+        }
+        result.indexedDB.push(dbItem);
+      }
+    } else {
+      result.warnings.push("indexedDB.databases() is unavailable");
+    }
+  } catch (error) {
+    result.warnings.push(`IndexedDB snapshot failed: ${error?.message || String(error)}`);
+  }
+
+  const bytesToBase64 = (bytes) => {
+    let out = "";
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {
+      out += String.fromCharCode(...bytes.subarray(i, Math.min(i + step, bytes.length)));
+    }
+    return btoa(out);
+  };
+  const readLimited = async (response, maxBytes) => {
+    if (!response.body || !response.body.getReader) {
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > maxBytes) return { omitted: true, reason: "body-too-large", byteLength: buffer.byteLength };
+      return { omitted: false, bytes: new Uint8Array(buffer), byteLength: buffer.byteLength };
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      const bytes = part.value instanceof Uint8Array ? part.value : new Uint8Array(part.value);
+      total += bytes.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch (_) { }
+        return { omitted: true, reason: "body-too-large", byteLength: total };
+      }
+      chunks.push(bytes);
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const part of chunks) { merged.set(part, offset); offset += part.length; }
+    return { omitted: false, bytes: merged, byteLength: total };
+  };
+  try {
+    if (globalThis.caches) {
+      for (const cacheName of await caches.keys()) {
+        const cacheItem = { name: cacheName, entries: [], truncated: false, error: null };
+        try {
+          const cache = await caches.open(cacheName);
+          const requests = await cache.keys();
+          if (requests.length > 250) cacheItem.truncated = true;
+          for (const request of requests.slice(0, 250)) {
+            try {
+              const response = await cache.match(request);
+              if (!response) continue;
+              const headers = {};
+              response.headers.forEach((value, key) => { headers[key] = value; });
+              const body = await readLimited(response.clone(), 1000000);
+              const contentType = response.headers.get("content-type") || "";
+              const textual = /(^text\/|json|javascript|xml|svg|x-www-form-urlencoded)/i.test(contentType);
+              const entry = {
+                request: { url: request.url, method: request.method, headers: Object.fromEntries(request.headers.entries()) },
+                response: { status: response.status, statusText: response.statusText, type: response.type, redirected: response.redirected, url: response.url, headers },
+                body: null
+              };
+              if (body.omitted) entry.body = { omitted: true, reason: body.reason, observedBytes: body.byteLength };
+              else if (textual) entry.body = { omitted: false, encoding: "utf-8", text: new TextDecoder().decode(body.bytes), byteLength: body.byteLength };
+              else entry.body = { omitted: false, encoding: "base64", data: bytesToBase64(body.bytes), byteLength: body.byteLength };
+              cacheItem.entries.push(entry);
+            } catch (error) {
+              cacheItem.entries.push({ error: error?.message || String(error) });
+            }
+          }
+        } catch (error) {
+          cacheItem.error = error?.message || String(error);
+        }
+        result.cacheStorage.push(cacheItem);
+      }
+    } else {
+      result.warnings.push("CacheStorage is unavailable");
+    }
+  } catch (error) {
+    result.warnings.push(`CacheStorage snapshot failed: ${error?.message || String(error)}`);
+  }
+  return JSON.stringify(result);
+}
+
+function heavyStorageExpression() {
+  return `(${pageHeavyStorageMain.toString()})();`;
+}
+
+async function captureBasicSnapshot(sessionId, tabId, phase) {
+  const target = { tabId };
+  try {
+    const raw = await evaluateValue(target, basicSnapshotExpression());
+    const snapshot = JSON.parse(raw || "{}");
+    const html = typeof snapshot.html === "string" ? snapshot.html : "";
+    delete snapshot.html;
+    await putArtifact(sessionId, `browser/${phase}/page-snapshot.json`, snapshot, "json");
+    if (html) await putArtifact(sessionId, phase === "end" ? "page/page.html" : "page/start.html", html, "text");
+    for (const warning of snapshot.warnings || []) await addWarning(sessionId, `${phase}-snapshot-warning`, warning);
+  } catch (error) {
+    await addWarning(sessionId, `${phase}-page-snapshot-failed`, `Не удалось сохранить ${phase} snapshot страницы.`, error?.message || String(error));
+  }
+  try {
+    const cookies = await debuggerCommand(target, "Network.getCookies", {});
+    await putArtifact(sessionId, `browser/${phase}/cookies.json`, cookies.cookies || [], "json");
+  } catch (error) {
+    await addWarning(sessionId, `${phase}-cookies-failed`, "Не удалось сохранить cookies.", error?.message || String(error));
+  }
+  try {
+    const metrics = await debuggerCommand(target, "Performance.getMetrics", {});
+    await putArtifact(sessionId, `browser/${phase}/performance-metrics.json`, metrics, "json");
+  } catch (error) {
+    await addWarning(sessionId, `${phase}-performance-failed`, "Не удалось сохранить Performance metrics.", error?.message || String(error));
+  }
+  try {
+    const screenshot = await debuggerCommand(target, "Page.captureScreenshot", { format: "png", fromSurface: true, captureBeyondViewport: false });
+    if (screenshot.data) await putArtifact(sessionId, `screenshots/${phase}.png`, screenshot.data, "base64");
+  } catch (error) {
+    await addWarning(sessionId, `${phase}-screenshot-failed`, "Не удалось сделать снимок страницы.", error?.message || String(error));
+  }
+}
+
+async function captureHeavySnapshot(sessionId, tabId) {
+  const target = { tabId };
+  try {
+    const raw = await evaluateValue(target, heavyStorageExpression());
+    const snapshot = JSON.parse(raw || "{}");
+    await putArtifact(sessionId, "browser/end/web-storage-deep.json", snapshot, "json");
+    for (const warning of snapshot.warnings || []) await addWarning(sessionId, "storage-snapshot-warning", warning);
+  } catch (error) {
+    await addWarning(sessionId, "storage-snapshot-failed", "Не удалось сохранить IndexedDB/Cache Storage.", error?.message || String(error));
+  }
+  try {
+    const origin = await evaluateValue(target, "location.origin");
+    if (typeof origin !== "string" || !origin || origin === "null") {
+      throw new Error("Текущая страница не имеет обычного origin.");
+    }
+    const usage = await debuggerCommand(target, "Storage.getUsageAndQuota", { origin });
+    await putArtifact(sessionId, "browser/end/storage-usage.json", usage, "json", { origin });
+  } catch (error) {
+    await addWarning(sessionId, "storage-usage-failed", "Не удалось получить сведения об использовании browser storage.", error?.message || String(error));
+  }
+  try {
+    const tree = await debuggerCommand(target, "Page.getResourceTree", {});
+    await putArtifact(sessionId, "browser/end/resource-tree.json", tree, "json");
+  } catch (error) {
+    await addWarning(sessionId, "resource-tree-failed", "Не удалось сохранить дерево ресурсов страницы.", error?.message || String(error));
+  }
+  try {
+    const mhtml = await debuggerCommand(target, "Page.captureSnapshot", { format: "mhtml" });
+    if (mhtml.data) {
+      if (mhtml.data.length <= 50 * 1024 * 1024) {
+        await putArtifact(sessionId, "page/page.mhtml", mhtml.data, "text");
+      } else {
+        await addWarning(sessionId, "mhtml-too-large", "MHTML snapshot не включён: превышен лимит 50 МБ.", { chars: mhtml.data.length });
+      }
+    }
+  } catch (error) {
+    await addWarning(sessionId, "mhtml-failed", "Не удалось сохранить MHTML snapshot.", error?.message || String(error));
+  }
+  try {
+    const dom = await debuggerCommand(target, "DOMSnapshot.captureSnapshot", {
+      computedStyles: [],
+      includePaintOrder: false,
+      includeDOMRects: false,
+      includeBlendedBackgroundColors: false,
+      includeTextColorOpacities: false
+    });
+    const domSize = JSON.stringify(dom).length;
+    if (domSize <= 50 * 1024 * 1024) {
+      await putArtifact(sessionId, "page/dom-snapshot.json", dom, "json");
+    } else {
+      await addWarning(sessionId, "dom-snapshot-too-large", "DOMSnapshot не включён: превышен лимит 50 МБ.", { chars: domSize });
+    }
+  } catch (error) {
+    await addWarning(sessionId, "dom-snapshot-failed", "Не удалось сохранить DOMSnapshot.", error?.message || String(error));
+  }
+}
+
+async function getActiveSessions() {
+  const result = await storageGet(ACTIVE_KEY);
+  return result[ACTIVE_KEY] || {};
+}
+
+async function setActiveSessions(sessions) {
+  await storageSet({ [ACTIVE_KEY]: sessions });
+}
+
+async function getActiveSessionId(tabId) {
+  const sessions = await getActiveSessions();
+  return sessions[String(tabId)] || null;
+}
+
+async function setActiveSession(tabId, sessionId) {
+  const sessions = await getActiveSessions();
+  if (sessionId) {
+    sessions[String(tabId)] = sessionId;
+  } else {
+    delete sessions[String(tabId)];
+  }
+  await setActiveSessions(sessions);
+}
+
+async function updateActionState(tabId, state, detail = "") {
+  if (!Number.isInteger(tabId) || !chrome.action) return;
+  const badge = state === "recording" ? "REC" : state === "exporting" ? "…" : state === "error" ? "ERR" : "";
+  const title = state === "recording"
+    ? "Идёт запись активности этой вкладки. Нажмите, чтобы остановить."
+    : state === "exporting"
+      ? "Формируется ZIP записи…"
+      : state === "error"
+        ? `Ошибка записи${detail ? `: ${detail}` : ""}`
+        : "Запись активности текущей вкладки";
+  try { await chrome.action.setBadgeText({ tabId, text: badge }); } catch (_) { }
+  try { await chrome.action.setTitle({ tabId, title }); } catch (_) { }
+}
+
+async function notifyTab(tabId, state, detail = "") {
+  await updateActionState(tabId, state, detail);
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { type: "capture:state", state, detail }, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
+
+async function requestTab(tabId, message) {
+  return await new Promise((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(chromeError
