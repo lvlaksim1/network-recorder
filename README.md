@@ -33,3 +33,22 @@ The retained stable **Network Recorder v1.6.0** source has been imported byte-fo
 - source files: `src/manifest.json`, `src/background.js`, `src/content.js`, `src/offscreen.js`, `src/offscreen.html`
 
 Next: configure GitHub-side signing with the existing RSA private key in secret scope and publish the first signed CRX release without changing the Extension ID.
+
+
+## Signing secret
+
+The repository signing secret is named `RSA_PRIVATE_KEY_BASE64`.
+
+Its value is the Base64-encoded Windows CSP private-key blob used by the retained v1.6.0 baseline. The workflow imports it only on the ephemeral Windows runner, signs CRX3, verifies the resulting Extension ID, then deletes the temporary key file.
+
+## Verified signed prerelease
+
+The first GitHub-signed prerelease is `network-recorder-v1.6.0-preview-1`.
+
+- version: `1.6.0`
+- Extension ID: `paolfcaakecapidipfcfbbhgkpcmgcip`
+- CRX SHA-256: `3516149ea638f6ff10626c1ae974c92627e220c1e86b5c5195abdea4700c26cf`
+- release assets: `Network_Recorder_v1.6.0.crx` and `extension-release.json`
+- GitHub Actions artifacts: none retained
+
+The published CRX was independently validated by ExtensionInstaller's CRX3 inspector.
