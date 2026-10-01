@@ -25,4 +25,11 @@ It intentionally does **not** contain a separate Project Manager or Context Caps
 
 ## Current onboarding state
 
-The repository has been created and secured against accidental key/binary commits. The retained stable Network Recorder v1.6.0 source will be onboarded next, followed by GitHub-side signing and the first signed release for ExtensionInstaller integration.
+The retained stable **Network Recorder v1.6.0** source has been imported byte-for-byte from the owner-retained archive.
+
+- source archive SHA-256: `eeb0cdfdf6323c96c6aea777ad9aed889522dc9de13e467b8f447723612e1db3`
+- baseline commit: `db1993a63c08beb1a7b7353f1bfe49419d6bafde`
+- stable Extension ID: `paolfcaakecapidipfcfbbhgkpcmgcip`
+- source files: `src/manifest.json`, `src/background.js`, `src/content.js`, `src/offscreen.js`, `src/offscreen.html`
+
+Next: configure GitHub-side signing with the existing RSA private key in secret scope and publish the first signed CRX release without changing the Extension ID.
