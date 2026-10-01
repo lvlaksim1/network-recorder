@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Network Recorder",
+  "version": "1.6.0",
+  "description": "Records a high-fidelity browser tab session on any website: network traffic, bodies, downloads, cookies, storage, DOM/page snapshots, console/errors, user actions, resources, performance, optional Chromium Tracing and browser artifacts, then exports them to ZIP.",
+  "permissions": [
+    "storage",
+    "debugger",
+    "downloads",
+    "offscreen",
+    "unlimitedStorage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "Запись активности текущей вкладки"
+  }
+}
