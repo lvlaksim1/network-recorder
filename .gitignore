@@ -1,0 +1,20 @@
+# Private signing material
+RSA_PRIVATE_KEY.txt
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Build and release outputs
+*.crx
+*.zip
+dist/
+build/
+out/
+
+# Local/runtime files
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
