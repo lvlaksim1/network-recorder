@@ -1,0 +1,298 @@
+== "active") return;
+
+  session.tracing.status = "stopping";
+  await dbPut("sessions", session);
+  const waiter = createTracingCompletionWaiter(target.tabId);
+  let stream = null;
+  let chunks = 0;
+  let capturedBytes = 0;
+
+  try {
+    await debuggerCommand(target, "Tracing.end", {});
+    const completed = await waiter.promise;
+    stream = completed?.stream || null;
+    session.tracing.dataLossOccurred = Boolean(completed?.dataLossOccurred);
+    session.tracing.traceFormat = completed?.traceFormat || "json";
+    session.tracing.traceCompression = completed?.streamCompression || "none";
+    if (!stream) throw new Error("Tracing.tracingComplete не вернул stream handle.");
+
+    while (true) {
+      const part = await debuggerCommand(target, "IO.read", { handle: stream, size: TRACE_READ_CHUNK });
+      const bytes = traceDataToBytes(part?.data || "", Boolean(part?.base64Encoded));
+      if (bytes.byteLength > 0) {
+        await dbAdd("traceChunks", {
+          sessionId: session.id,
+          index: chunks,
+          capturedAt: new Date().toISOString(),
+          bytes
+        });
+        chunks += 1;
+        capturedBytes += bytes.byteLength;
+      }
+      if (part?.eof) break;
+    }
+
+    session.tracing.status = "complete";
+    session.tracing.completedAt = new Date().toISOString();
+    session.tracing.chunks = chunks;
+    session.tracing.capturedBytes = capturedBytes;
+    session.tracing.error = null;
+    await dbPut("sessions", session);
+    await addRawEvent(session.id, target, "Recorder.tracingComplete", {
+      dataLossOccurred: session.tracing.dataLossOccurred,
+      chunks,
+      capturedBytes,
+      traceFormat: session.tracing.traceFormat,
+      traceCompression: session.tracing.traceCompression
+    });
+    if (session.tracing.dataLossOccurred) {
+      await addWarning(session.id, "tracing-data-loss", "Chromium сообщил о потере части trace-данных.", {
+        capturedBytes,
+        chunks
+      });
+    }
+  } catch (error) {
+    waiter.cancel(error);
+    try { await waiter.promise; } catch (_) { }
+    session.tracing.status = capturedBytes > 0 ? "partial" : "failed";
+    session.tracing.completedAt = new Date().toISOString();
+    session.tracing.chunks = chunks;
+    session.tracing.capturedBytes = capturedBytes;
+    session.tracing.error = error?.message || String(error);
+    await dbPut("sessions", session);
+    await addWarning(session.id, "tracing-stop-failed", "Не удалось полностью завершить или сохранить Chromium Tracing.", {
+      error: session.tracing.error,
+      capturedBytes,
+      chunks
+    });
+    await addRawEvent(session.id, target, "Recorder.tracingFailed", {
+      error: session.tracing.error,
+      capturedBytes,
+      chunks
+    });
+  } finally {
+    if (stream) {
+      try { await debuggerCommand(target, "IO.close", { handle: stream }); } catch (_) { }
+    }
+  }
+}
+
+const BLOB_BINDING = "__einvRecorderCapture";
+
+function pageBlobHookMain() {
+  if (globalThis.__EINV_NR_BLOB_HOOK_INSTALLED__) {
+    globalThis.__EINV_NR_CAPTURE_ACTIVE__ = true;
+    return;
+  }
+  globalThis.__EINV_NR_BLOB_HOOK_INSTALLED__ = true;
+  globalThis.__EINV_NR_CAPTURE_ACTIVE__ = true;
+  const send = (payload) => {
+    try {
+      const fn = globalThis.__einvRecorderCapture;
+      if (typeof fn === "function") fn(JSON.stringify(payload));
+    } catch (_) { }
+  };
+  const bytesToBase64 = (bytes) => {
+    let out = "";
+    const step = 0x8000;
+    for (let i = 0; i < bytes.length; i += step) {
+      out += String.fromCharCode(...bytes.subarray(i, Math.min(i + step, bytes.length)));
+    }
+    return btoa(out);
+  };
+  const captureBlob = async (blob, objectUrl) => {
+    const blobId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    send({ kind: "blob-meta", blobId, objectUrl, mimeType: blob.type || "", size: blob.size || 0, createdAt: new Date().toISOString() });
+    let index = 0;
+    let total = 0;
+    try {
+      if (blob.stream && typeof blob.stream === "function") {
+        const reader = blob.stream().getReader();
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          if (!globalThis.__EINV_NR_CAPTURE_ACTIVE__) {
+            try { await reader.cancel(); } catch (_) { }
+            throw new Error("capture-stopped");
+          }
+          const bytes = part.value instanceof Uint8Array ? part.value : new Uint8Array(part.value);
+          total += bytes.byteLength;
+          send({ kind: "blob-chunk", blobId, index, data: bytesToBase64(bytes) });
+          index += 1;
+        }
+      } else {
+        const buffer = await blob.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        const chunkSize = 128 * 1024;
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          if (!globalThis.__EINV_NR_CAPTURE_ACTIVE__) throw new Error("capture-stopped");
+          const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+          total += chunk.byteLength;
+          send({ kind: "blob-chunk", blobId, index, data: bytesToBase64(chunk) });
+          index += 1;
+        }
+      }
+      send({ kind: "blob-complete", blobId, chunks: index, capturedBytes: total, completedAt: new Date().toISOString() });
+    } catch (error) {
+      send({ kind: "blob-error", blobId, error: error?.message || String(error), capturedBytes: total });
+    }
+  };
+  const originalCreate = URL.createObjectURL.bind(URL);
+  URL.createObjectURL = function(value) {
+    const objectUrl = originalCreate(value);
+    if (globalThis.__EINV_NR_CAPTURE_ACTIVE__ && typeof Blob !== "undefined" && value instanceof Blob) {
+      captureBlob(value, objectUrl);
+    }
+    return objectUrl;
+  };
+  send({ kind: "hook-ready", at: new Date().toISOString(), href: location.href });
+}
+
+function blobHookSource() {
+  return `(${pageBlobHookMain.toString()})();`;
+}
+
+async function installBlobHook(target, sessionId, source) {
+  try {
+    await debuggerCommand(target, "Runtime.addBinding", { name: BLOB_BINDING });
+    const sourceCode = blobHookSource();
+    try {
+      await debuggerCommand(target, "Page.addScriptToEvaluateOnNewDocument", { source: sourceCode, runImmediately: true });
+    } catch (_) {
+      try { await debuggerCommand(target, "Page.addScriptToEvaluateOnNewDocument", { source: sourceCode }); } catch (_) { }
+    }
+    try { await evaluateValue(target, sourceCode, { awaitPromise: false }); } catch (_) { }
+  } catch (error) {
+    await addWarning(sessionId, "blob-hook-unavailable", "Не удалось включить перехват blob:-файлов.", error?.message || String(error));
+    await addRawEvent(sessionId, source, "Recorder.blobHookUnavailable", { error: error?.message || String(error) });
+  }
+}
+
+async function disableBlobHook(tabId) {
+  try { await evaluateValue({ tabId }, "globalThis.__EINV_NR_CAPTURE_ACTIVE__ = false; true", { awaitPromise: false }); } catch (_) { }
+}
+
+function pageBasicSnapshotMain() {
+  const warnings = [];
+  const safeStorage = (storage, label) => {
+    const out = {};
+    let total = 0;
+    const maxTotal = 10 * 1024 * 1024;
+    const maxValue = 1024 * 1024;
+    try {
+      for (let i = 0; i < storage.length; i += 1) {
+        const key = storage.key(i);
+        let value = storage.getItem(key);
+        if (typeof value !== "string") value = String(value ?? "");
+        const originalLength = value.length;
+        if (value.length > maxValue) {
+          value = value.slice(0, maxValue);
+          warnings.push(`${label}:${key}: value truncated from ${originalLength} chars`);
+        }
+        if (total + value.length > maxTotal) {
+          warnings.push(`${label}: total size limit reached`);
+          break;
+        }
+        total += value.length;
+        out[key] = value;
+      }
+    } catch (error) {
+      warnings.push(`${label}: ${error?.message || String(error)}`);
+    }
+    return out;
+  };
+  const html = document.documentElement?.outerHTML || "";
+  const maxHtml = 20 * 1024 * 1024;
+  const resources = performance.getEntriesByType("resource").slice(-5000).map((entry) => entry.toJSON ? entry.toJSON() : {
+    name: entry.name,
+    initiatorType: entry.initiatorType,
+    startTime: entry.startTime,
+    duration: entry.duration,
+    transferSize: entry.transferSize,
+    encodedBodySize: entry.encodedBodySize,
+    decodedBodySize: entry.decodedBodySize
+  });
+  const navigation = performance.getEntriesByType("navigation").map((entry) => entry.toJSON ? entry.toJSON() : {
+    name: entry.name,
+    startTime: entry.startTime,
+    duration: entry.duration
+  });
+  return JSON.stringify({
+    capturedAt: new Date().toISOString(),
+    url: location.href,
+    title: document.title,
+    referrer: document.referrer,
+    readyState: document.readyState,
+    visibilityState: document.visibilityState,
+    userAgent: navigator.userAgent,
+    language: navigator.language,
+    languages: Array.from(navigator.languages || []),
+    platform: navigator.platform,
+    viewport: { width: innerWidth, height: innerHeight, devicePixelRatio: devicePixelRatio || 1, scrollX, scrollY },
+    screen: { width: screen.width, height: screen.height, availWidth: screen.availWidth, availHeight: screen.availHeight, colorDepth: screen.colorDepth },
+    documentCookie: document.cookie,
+    localStorage: safeStorage(localStorage, "localStorage"),
+    sessionStorage: safeStorage(sessionStorage, "sessionStorage"),
+    performance: { timeOrigin: performance.timeOrigin, navigation, resources },
+    html: html.length > maxHtml ? html.slice(0, maxHtml) : html,
+    htmlOriginalLength: html.length,
+    htmlTruncated: html.length > maxHtml,
+    warnings
+  });
+}
+
+function basicSnapshotExpression() {
+  return `(${pageBasicSnapshotMain.toString()})();`;
+}
+
+async function pageHeavyStorageMain() {
+  const result = {
+    capturedAt: new Date().toISOString(),
+    indexedDB: [],
+    cacheStorage: [],
+    warnings: [],
+    limits: {
+      indexedDbRecordsPerStore: 1000,
+      indexedDbSerializedCharsPerStore: 4000000,
+      cacheRequestsPerCache: 250,
+      cacheBodyBytes: 1000000
+    }
+  };
+  const toJsonSafe = (value) => {
+    const seen = new WeakSet();
+    const text = JSON.stringify(value, (key, item) => {
+      if (typeof item === "bigint") return { __type: "bigint", value: item.toString() };
+      if (item instanceof Date) return { __type: "date", value: item.toISOString() };
+      if (item instanceof Blob) return { __type: "blob", size: item.size, type: item.type };
+      if (item instanceof ArrayBuffer) return { __type: "arraybuffer", byteLength: item.byteLength };
+      if (ArrayBuffer.isView(item)) return { __type: item.constructor?.name || "typedarray", byteLength: item.byteLength };
+      if (item && typeof item === "object") {
+        if (seen.has(item)) return "[Circular]";
+        seen.add(item);
+      }
+      return item;
+    });
+    return text == null ? null : JSON.parse(text);
+  };
+  const requestPromise = (request) => new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+  });
+  try {
+    if (indexedDB.databases) {
+      const dbInfos = await indexedDB.databases();
+      for (const info of dbInfos) {
+        if (!info?.name) continue;
+        const dbItem = { name: info.name, version: info.version ?? null, stores: [], error: null };
+        try {
+          const db = await requestPromise(indexedDB.open(info.name));
+          for (const storeName of Array.from(db.objectStoreNames)) {
+            const storeItem = { name: storeName, keyPath: null, autoIncrement: false, indexes: [], records: [], truncated: false, error: null };
+            try {
+              const tx = db.transaction(storeName, "readonly");
+              const store = tx.objectStore(storeName);
+              storeItem.keyPath = store.keyPath;
+              storeItem.autoIncrement = store.autoIncrement;
+              storeItem.indexes = Array.from(store.indexNames).map((name) => {
+                const idx = store.index(name);
+       
