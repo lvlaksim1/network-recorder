@@ -1,0 +1,82 @@
+name: Build Signed Prerelease
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  build:
+    if: github.event.issue.user.login == 'lvlaksim1' && github.event.issue.title == '[BUILD_SIGNED_PRERELEASE]'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and sign CRX3
+        id: build
+        shell: powershell
+        env:
+          RSA_PRIVATE_KEY_BASE64: ${{ secrets.RSA_PRIVATE_KEY_BASE64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'network-recorder-release'
+          $result = .\tools\Build-SignedCrx.ps1 -SourceDir '.\src' -PrivateKeyBase64 $env:RSA_PRIVATE_KEY_BASE64 -OutputDir $out -ExpectedExtensionId 'paolfcaakecapidipfcfbbhgkpcmgcip'
+          "version=$($result.Version)" >> $env:GITHUB_OUTPUT
+          "extension_id=$($result.ExtensionId)" >> $env:GITHUB_OUTPUT
+          "crx_path=$($result.CrxPath)" >> $env:GITHUB_OUTPUT
+          "crx_sha256=$($result.CrxSha256)" >> $env:GITHUB_OUTPUT
+          "descriptor_path=$($result.DescriptorPath)" >> $env:GITHUB_OUTPUT
+
+      - name: Validate signed output
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ steps.build.outputs.extension_id }}' -cne 'paolfcaakecapidipfcfbbhgkpcmgcip') { throw 'Extension ID changed.' }
+          $crx = '${{ steps.build.outputs.crx_path }}'
+          $descriptor = '${{ steps.build.outputs.descriptor_path }}'
+          if (-not (Test-Path -LiteralPath $crx -PathType Leaf)) { throw 'CRX not found.' }
+          if (-not (Test-Path -LiteralPath $descriptor -PathType Leaf)) { throw 'Descriptor not found.' }
+          if ((Get-FileHash -LiteralPath $crx -Algorithm SHA256).Hash.ToLowerInvariant() -cne '${{ steps.build.outputs.crx_sha256 }}') { throw 'CRX SHA-256 mismatch.' }
+
+      - name: Publish prerelease directly
+        id: release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "network-recorder-v1.6.0-preview-${{ github.run_number }}"
+          $title = "Network Recorder v1.6.0 preview ${{ github.run_number }}"
+          $notes = "Signed prerelease for ExtensionInstaller integration verification." + [Environment]::NewLine + [Environment]::NewLine +
+            "- Version: ${{ steps.build.outputs.version }}" + [Environment]::NewLine +
+            "- Extension ID: ${{ steps.build.outputs.extension_id }}" + [Environment]::NewLine +
+            "- CRX SHA-256: ${{ steps.build.outputs.crx_sha256 }}" + [Environment]::NewLine +
+            "- Signed in GitHub Actions from RSA_PRIVATE_KEY_BASE64" + [Environment]::NewLine +
+            "- No private key is stored in Git or published as a release asset" + [Environment]::NewLine +
+            "- No GitHub Actions artifact is retained"
+          gh release create $tag "${{ steps.build.outputs.crx_path }}" "${{ steps.build.outputs.descriptor_path }}" --target "$env:GITHUB_SHA" --title $title --notes $notes --prerelease
+          $url = gh release view $tag --json url -q .url
+          "release_url=$url" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Report
+        if: always()
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RESULT: ${{ job.status }}
+          RELEASE_URL: ${{ steps.release.outputs.release_url }}
+          EXTENSION_ID: ${{ steps.build.outputs.extension_id }}
+          SHA256: ${{ steps.build.outputs.crx_sha256 }}
+        run: |
+          if ($env:RESULT -eq 'success') {
+            $body = "SIGNED_PRERELEASE_READY" + [Environment]::NewLine + "Extension ID: $env:EXTENSION_ID" + [Environment]::NewLine + "CRX SHA-256: $env:SHA256" + [Environment]::NewLine + $env:RELEASE_URL
+          } else {
+            $body = "SIGNED_PRERELEASE_FAILED"
+          }
+          gh api --method POST "repos/$env:GITHUB_REPOSITORY/issues/$env:ISSUE_NUMBER/comments" -f body="$body"
