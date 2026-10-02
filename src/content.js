@@ -9,6 +9,20 @@
   const SETTINGS_STORE = "settings";
   const DIRECTORY_KEY = "saveDirectory";
   const TRACING_KEY = "chromiumTracingEnabled";
+  const API_BODIES_KEY = "captureApiBodiesEnabled";
+  const PAGE_RESOURCES_KEY = "capturePageResourcesEnabled";
+  const ALL_RESOURCE_BODIES_KEY = "captureAllResourceBodiesEnabled";
+  const FILES_BLOBS_KEY = "captureFilesAndBlobsEnabled";
+  const DEEP_DIAGNOSTICS_KEY = "captureDeepDiagnosticsEnabled";
+  const BOOLEAN_SETTING_DEFAULTS = Object.freeze({
+    [TRACING_KEY]: false,
+    [API_BODIES_KEY]: true,
+    [PAGE_RESOURCES_KEY]: true,
+    [ALL_RESOURCE_BODIES_KEY]: false,
+    [FILES_BLOBS_KEY]: false,
+    [DEEP_DIAGNOSTICS_KEY]: false
+  });
+  const GLOBAL_BOOLEAN_SETTINGS = new Set(Object.keys(BOOLEAN_SETTING_DEFAULTS));
   const PAGE_MARGIN = 8;
   const DRAG_THRESHOLD = 4;
 
@@ -131,8 +145,9 @@
   });
 
   const getSetting = async (key) => {
-    if (key === TRACING_KEY) {
-      return await getGlobalSetting(key);
+    if (GLOBAL_BOOLEAN_SETTINGS.has(key)) {
+      const value = await getGlobalSetting(key);
+      return value == null ? BOOLEAN_SETTING_DEFAULTS[key] : Boolean(value);
     }
     const db = await openSettingsDb();
     try {
@@ -148,7 +163,7 @@
   };
 
   const setSetting = async (key, value) => {
-    if (key === TRACING_KEY) {
+    if (GLOBAL_BOOLEAN_SETTINGS.has(key)) {
       await setGlobalSetting(key, Boolean(value));
       return;
     }
@@ -167,8 +182,8 @@
   };
 
   const deleteSetting = async (key) => {
-    if (key === TRACING_KEY) {
-      await setGlobalSetting(key, false);
+    if (GLOBAL_BOOLEAN_SETTINGS.has(key)) {
+      await setGlobalSetting(key, BOOLEAN_SETTING_DEFAULTS[key]);
       return;
     }
     const db = await openSettingsDb();
@@ -519,7 +534,7 @@
       right: "0",
       zIndex: "2147483647",
       display: "block",
-      width: "330px",
+      width: "390px",
       touchAction: "auto",
       userSelect: "auto"
     });
@@ -538,7 +553,9 @@
       *, *::before, *::after { box-sizing: border-box; }
 
       .panel {
-        width: 330px;
+        width: 390px;
+        max-height: calc(100vh - 32px);
+        overflow-y: auto;
         padding: 12px 14px 12px;
         border: 1px solid #d9d9d9;
         border-radius: 12px;
@@ -700,27 +717,65 @@
     status.className = "status";
     status.setAttribute("role", "alert");
 
-    const traceRow = document.createElement("label");
-    traceRow.className = "trace-row";
+    const toggleSpecs = [
+      {
+        key: API_BODIES_KEY,
+        title: "Тела API (XHR / Fetch)",
+        note: "Включено по умолчанию. Сохраняет request/response bodies API-запросов."
+      },
+      {
+        key: PAGE_RESOURCES_KEY,
+        title: "Текстовые ресурсы страницы",
+        note: "HTML, JavaScript, CSS и другие текстовые ресурсы. Картинки, видео и шрифты сюда не входят."
+      },
+      {
+        key: ALL_RESOURCE_BODIES_KEY,
+        title: "Все тела ресурсов",
+        note: "Добавляет изображения, шрифты и прочие бинарные response bodies. Может резко увеличить ZIP."
+      },
+      {
+        key: FILES_BLOBS_KEY,
+        title: "Файлы и blob:-объекты",
+        note: "Сохраняет байты скачиваемых файлов и blob:-объектов. Метаданные загрузок пишутся и без этой опции."
+      },
+      {
+        key: DEEP_DIAGNOSTICS_KEY,
+        title: "Глубокая диагностика страницы",
+        note: "IndexedDB, Cache Storage, MHTML и DOMSnapshot. Тяжёлый режим; по умолчанию выключен."
+      },
+      {
+        key: TRACING_KEY,
+        title: "Chromium Tracing",
+        note: "Полный trace Chromium. Самый тяжёлый режим; по умолчанию выключен."
+      }
+    ];
 
-    const traceCheckbox = document.createElement("input");
-    traceCheckbox.type = "checkbox";
-    traceCheckbox.className = "trace-checkbox";
-    traceCheckbox.setAttribute("aria-label", "Chromium Tracing");
+    const toggleControls = new Map();
+    const toggleRows = toggleSpecs.map((spec) => {
+      const row = document.createElement("label");
+      row.className = "trace-row";
 
-    const traceCopy = document.createElement("div");
-    traceCopy.className = "trace-copy";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "trace-checkbox";
+      checkbox.setAttribute("aria-label", spec.title);
 
-    const traceTitle = document.createElement("div");
-    traceTitle.className = "trace-title";
-    traceTitle.textContent = "Chromium Tracing";
+      const copy = document.createElement("div");
+      copy.className = "trace-copy";
 
-    const traceNote = document.createElement("div");
-    traceNote.className = "trace-note";
-    traceNote.textContent = "Полный trace Chromium для следующей записи. Может сильно увеличить нагрузку и размер ZIP.";
+      const rowTitle = document.createElement("div");
+      rowTitle.className = "trace-title";
+      rowTitle.textContent = spec.title;
 
-    traceCopy.append(traceTitle, traceNote);
-    traceRow.append(traceCheckbox, traceCopy);
+      const note = document.createElement("div");
+      note.className = "trace-note";
+      note.textContent = spec.note;
+
+      copy.append(rowTitle, note);
+      row.append(checkbox, copy);
+      toggleControls.set(spec.key, { checkbox, note, spec });
+      return row;
+    });
 
     const footer = document.createElement("div");
     footer.className = "footer";
@@ -736,11 +791,14 @@
     };
 
     const refreshSettings = async () => {
-      traceCheckbox.checked = Boolean(await getSetting(TRACING_KEY));
-      traceCheckbox.disabled = currentState === "recording" || currentState === "exporting";
-      traceNote.textContent = currentState === "recording"
-        ? "Текущая запись уже запущена; изменение применяется со следующей сессии."
-        : "Полный trace Chromium для следующей записи. Может сильно увеличить нагрузку и размер ZIP.";
+      const locked = currentState === "recording" || currentState === "exporting";
+      for (const [key, control] of toggleControls) {
+        control.checkbox.checked = Boolean(await getSetting(key));
+        control.checkbox.disabled = locked;
+        control.note.textContent = currentState === "recording"
+          ? "Текущая запись уже запущена; изменение применяется со следующей сессии."
+          : control.spec.note;
+      }
 
       const handle = await getSetting(DIRECTORY_KEY);
       if (!handle) {
@@ -764,18 +822,21 @@
       }
     };
 
-    traceCheckbox.addEventListener("change", async () => {
-      traceCheckbox.disabled = true;
-      setSettingsError("");
-      try {
-        await setSetting(TRACING_KEY, traceCheckbox.checked);
-      } catch (error) {
-        traceCheckbox.checked = !traceCheckbox.checked;
-        setSettingsError(error?.message || String(error));
-      } finally {
-        traceCheckbox.disabled = currentState === "recording" || currentState === "exporting";
-      }
-    });
+    for (const [key, control] of toggleControls) {
+      control.checkbox.addEventListener("change", async () => {
+        const previous = !control.checkbox.checked;
+        control.checkbox.disabled = true;
+        setSettingsError("");
+        try {
+          await setSetting(key, control.checkbox.checked);
+        } catch (error) {
+          control.checkbox.checked = previous;
+          setSettingsError(error?.message || String(error));
+        } finally {
+          control.checkbox.disabled = currentState === "recording" || currentState === "exporting";
+        }
+      });
+    }
 
     choose.addEventListener("click", async () => {
       setSettingsError("");
@@ -805,7 +866,7 @@
 
     ok.addEventListener("click", closeSettings);
 
-    panel.append(version, title, settingRow, folder, status, traceRow, footer);
+    panel.append(version, title, settingRow, folder, status, ...toggleRows, footer);
     settingRow.append(label, choose);
     footer.append(ok);
     shadow.append(style, panel);
@@ -815,7 +876,7 @@
     // Если кнопки находятся у края экрана, панель остаётся прикреплённой к ним,
     // но выбирает сторону выравнивания так, чтобы не выходить за границы viewport.
     const controlsRect = controls.getBoundingClientRect();
-    if (controlsRect.left + 330 <= window.innerWidth - PAGE_MARGIN) {
+    if (controlsRect.left + 390 <= window.innerWidth - PAGE_MARGIN) {
       host.style.left = "0";
       host.style.right = "auto";
     } else {
@@ -925,8 +986,15 @@
 
     button.disabled = true;
     try {
-      const tracingEnabled = currentState === "recording" ? false : Boolean(await getSetting(TRACING_KEY));
-      const response = await sendMessage({ type: "capture:toggle", tracingEnabled });
+      const captureOptions = currentState === "recording" ? null : {
+        tracingEnabled: Boolean(await getSetting(TRACING_KEY)),
+        apiBodies: Boolean(await getSetting(API_BODIES_KEY)),
+        pageResources: Boolean(await getSetting(PAGE_RESOURCES_KEY)),
+        allResourceBodies: Boolean(await getSetting(ALL_RESOURCE_BODIES_KEY)),
+        filesAndBlobs: Boolean(await getSetting(FILES_BLOBS_KEY)),
+        deepDiagnostics: Boolean(await getSetting(DEEP_DIAGNOSTICS_KEY))
+      };
+      const response = await sendMessage({ type: "capture:toggle", captureOptions });
       if (!response?.ok) {
         throw new Error(response?.error || "Не удалось изменить состояние записи.");
       }
