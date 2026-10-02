@@ -18,7 +18,7 @@ if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) { throw "Sourc
 $manifestPath = Join-Path $SourceDir "manifest.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $version = [string]$manifest.version
-if ($version -notmatch '^\\d+\\.\\d+\\.\\d+
+if ([string]::IsNullOrWhiteSpace($version)) { throw "Manifest version is empty." }
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $keyPath = Join-Path ([System.IO.Path]::GetTempPath()) ("network-recorder-key-" + [Guid]::NewGuid().ToString("N") + ".txt")
