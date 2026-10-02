@@ -1308,7 +1308,7 @@ async function captureCompletedBodies(sessionId, source, requestId, options, inf
   }
 }
 
-async function startCaptureasync function startCapture(tabId, url, options = {}) {
+async function startCapture(tabId, url, options = {}) {
   if (!Number.isInteger(tabId)) {
     throw new Error("Не удалось определить вкладку браузера.");
   }
