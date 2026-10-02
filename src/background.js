@@ -6,6 +6,13 @@ const ACTIVE_KEY = "einvNetworkRecorderActiveSessions";
 const PENDING_DOWNLOADS_KEY = "einvNetworkRecorderPendingDownloads";
 const OFFSCREEN_PATH = "offscreen.html";
 const TRACING_PREF_KEY = "chromiumTracingEnabled";
+const API_BODIES_PREF_KEY = "captureApiBodiesEnabled";
+const PAGE_RESOURCES_PREF_KEY = "capturePageResourcesEnabled";
+const ALL_RESOURCE_BODIES_PREF_KEY = "captureAllResourceBodiesEnabled";
+const FILES_BLOBS_PREF_KEY = "captureFilesAndBlobsEnabled";
+const DEEP_DIAGNOSTICS_PREF_KEY = "captureDeepDiagnosticsEnabled";
+const CAPTURE_PREF_KEYS = [TRACING_PREF_KEY, API_BODIES_PREF_KEY, PAGE_RESOURCES_PREF_KEY, ALL_RESOURCE_BODIES_PREF_KEY, FILES_BLOBS_PREF_KEY, DEEP_DIAGNOSTICS_PREF_KEY];
+const CAPTURE_DEFAULTS = Object.freeze({ tracingEnabled: false, apiBodies: true, pageResources: true, allResourceBodies: false, filesAndBlobs: false, deepDiagnostics: false });
 const NETWORK_BUFFER_TOTAL = 100 * 1024 * 1024;
 const NETWORK_BUFFER_RESOURCE = 25 * 1024 * 1024;
 const NETWORK_POST_DATA = 10 * 1024 * 1024;
@@ -14,6 +21,8 @@ const TRACE_STOP_TIMEOUT = 60 * 1000;
 
 let offscreenCreating = null;
 const recentRequestByUrl = new Map();
+const requestCaptureInfo = new Map();
+const sessionCaptureOptionsCache = new Map();
 const downloadStreamStarting = new Set();
 const tracingCompletionWaiters = new Map();
 const textEncoder = new TextEncoder();
@@ -37,6 +46,72 @@ function storageSet(value) {
       resolve();
     });
   });
+}
+function normalizeCaptureOptions(value = {}) {
+  return {
+    tracingEnabled: value.tracingEnabled == null ? CAPTURE_DEFAULTS.tracingEnabled : Boolean(value.tracingEnabled),
+    apiBodies: value.apiBodies == null ? CAPTURE_DEFAULTS.apiBodies : Boolean(value.apiBodies),
+    pageResources: value.pageResources == null ? CAPTURE_DEFAULTS.pageResources : Boolean(value.pageResources),
+    allResourceBodies: value.allResourceBodies == null ? CAPTURE_DEFAULTS.allResourceBodies : Boolean(value.allResourceBodies),
+    filesAndBlobs: value.filesAndBlobs == null ? CAPTURE_DEFAULTS.filesAndBlobs : Boolean(value.filesAndBlobs),
+    deepDiagnostics: value.deepDiagnostics == null ? CAPTURE_DEFAULTS.deepDiagnostics : Boolean(value.deepDiagnostics)
+  };
+}
+
+async function getStoredCaptureOptions() {
+  const stored = await storageGet(CAPTURE_PREF_KEYS);
+  return normalizeCaptureOptions({
+    tracingEnabled: stored[TRACING_PREF_KEY],
+    apiBodies: stored[API_BODIES_PREF_KEY],
+    pageResources: stored[PAGE_RESOURCES_PREF_KEY],
+    allResourceBodies: stored[ALL_RESOURCE_BODIES_PREF_KEY],
+    filesAndBlobs: stored[FILES_BLOBS_PREF_KEY],
+    deepDiagnostics: stored[DEEP_DIAGNOSTICS_PREF_KEY]
+  });
+}
+
+async function getSessionCaptureOptions(sessionId) {
+  if (sessionCaptureOptionsCache.has(sessionId)) return sessionCaptureOptionsCache.get(sessionId);
+  const session = await dbGet("sessions", sessionId);
+  const options = normalizeCaptureOptions(session?.captureOptions || {});
+  sessionCaptureOptionsCache.set(sessionId, options);
+  return options;
+}
+
+function requestCaptureKey(sessionId, source, requestId) {
+  return sessionId + "|" + (source?.sessionId || "root") + "|" + (requestId || "");
+}
+
+function getRequestCaptureInfo(sessionId, source, requestId) {
+  return requestCaptureInfo.get(requestCaptureKey(sessionId, source, requestId)) || { type: null, url: "", method: "", mimeType: "", status: null };
+}
+
+function isTextualResponse(info) {
+  const mime = String(info?.mimeType || "").toLowerCase();
+  const type = String(info?.type || "").toLowerCase();
+  if (["document", "script", "stylesheet", "manifest", "texttrack"].includes(type)) return true;
+  return /(^text\\/|json|javascript|ecmascript|xml|svg|x-www-form-urlencoded)/i.test(mime);
+}
+
+function responseBodyPolicy(options, info) {
+  const type = String(info?.type || "").toLowerCase();
+  if (options.allResourceBodies) return { capture: true, reason: "all-resource-bodies" };
+  if (type === "xhr" || type === "fetch") return options.apiBodies ? { capture: true, reason: "api-body" } : { capture: false, reason: "api-bodies-disabled" };
+  if (options.pageResources && isTextualResponse(info)) return { capture: true, reason: "text-page-resource" };
+  return { capture: false, reason: "metadata-only-resource" };
+}
+
+function requestBodyPolicy(options, info) {
+  const type = String(info?.type || "").toLowerCase();
+  if (type === "xhr" || type === "fetch") return Boolean(options.apiBodies);
+  return Boolean(options.allResourceBodies || (options.pageResources && isTextualResponse(info)));
+}
+
+function cleanupCaptureCaches(sessionId) {
+  sessionCaptureOptionsCache.delete(sessionId);
+  for (const key of requestCaptureInfo.keys()) {
+    if (key.startsWith(sessionId + "|")) requestCaptureInfo.delete(key);
+  }
 }
 
 function debuggerAttach(target) {
@@ -1208,7 +1283,8 @@ async function startCapture(tabId, url, options = {}) {
     stopReason: null,
     exportFile: null,
     extensionVersion: chrome.runtime.getManifest().version,
-    captureEngine: "chrome.debugger/CDP + Runtime/Storage snapshots",
+    captureEngine: "chrome.debugger/CDP selective capture + optional deep diagnostics",
+    captureOptions: normalizeCaptureOptions(options),
     tracing: {
       requested: Boolean(options?.tracingEnabled),
       status: options?.tracingEnabled ? "pending" : "disabled",
@@ -1226,6 +1302,7 @@ async function startCapture(tabId, url, options = {}) {
     }
   };
   await dbPut("sessions", session);
+  sessionCaptureOptionsCache.set(sessionId, session.captureOptions);
 
   const target = { tabId };
   try {
@@ -1238,13 +1315,16 @@ async function startCapture(tabId, url, options = {}) {
     await enablePageEvents(target);
     await enableRuntimeLogPerformance(target);
     await enableAutoAttach(target);
-    await installBlobHook(target, sessionId, target);
+    if (session.captureOptions.filesAndBlobs) {
+      await installBlobHook(target, sessionId, target);
+    }
 
     await addRawEvent(sessionId, target, "Recorder.captureStarted", {
       tabId,
       url,
       startTime: session.startTime,
-      captureVersion: 2,
+      captureVersion: 3,
+      captureOptions: session.captureOptions,
       chromiumTracing: session.tracing?.requested ? session.tracing.status : "disabled"
     });
     await captureBasicSnapshot(sessionId, tabId, "start");
@@ -1259,6 +1339,7 @@ async function startCapture(tabId, url, options = {}) {
     session.stopReason = error?.message || String(error);
     await dbPut("sessions", session);
     await setActiveSession(tabId, null);
+    cleanupCaptureCaches(sessionId);
     try { await debuggerDetach(target); } catch (_) { }
     throw error;
   }
@@ -1331,10 +1412,10 @@ async function stopCapture(tabId, reason = "user") {
   try {
     await addRawEvent(sessionId, { tabId }, "Recorder.captureStopping", { reason });
     await stopChromiumTracing(session, { tabId });
-    await disableBlobHook(tabId);
+    if (session.captureOptions?.filesAndBlobs) await disableBlobHook(tabId);
     await new Promise((resolve) => setTimeout(resolve, 150));
     await captureBasicSnapshot(sessionId, tabId, "end");
-    await captureHeavySnapshot(sessionId, tabId);
+    if (session.captureOptions?.deepDiagnostics) await captureHeavySnapshot(sessionId, tabId);
     try { await debuggerCommand({ tabId }, "Network.disable", {}); } catch (_) { }
     try { await debuggerDetach({ tabId }); } catch (_) { }
   } finally {
@@ -1344,6 +1425,7 @@ async function stopCapture(tabId, reason = "user") {
   session.status = "captured";
   session.endTime = new Date().toISOString();
   await dbPut("sessions", session);
+  cleanupCaptureCaches(sessionId);
   await requestExport(sessionId, tabId);
   return { state: "exporting", sessionId };
 }
@@ -1783,9 +1865,9 @@ chrome.action.onClicked.addListener((tab) => {
       return;
     }
 
-    const pref = await storageGet(TRACING_PREF_KEY);
+    const captureOptions = await getStoredCaptureOptions();
     try {
-      await startCapture(tabId, tab?.url || "", { tracingEnabled: Boolean(pref[TRACING_PREF_KEY]) });
+      await startCapture(tabId, tab?.url || "", captureOptions);
     } catch (error) {
       const detail = error?.message || String(error);
       await notifyTab(tabId, "error", detail);
@@ -1825,7 +1907,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const sessionId = await getActiveSessionId(tabId);
       const result = sessionId
         ? await stopCapture(tabId, "user")
-        : await startCapture(tabId, url, { tracingEnabled: Boolean(message.tracingEnabled) });
+        : await startCapture(tabId, url, normalizeCaptureOptions(message.captureOptions || {}));
       sendResponse({ ok: true, ...result });
       return;
     }
