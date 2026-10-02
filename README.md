@@ -52,3 +52,20 @@ The first GitHub-signed prerelease is `network-recorder-v1.6.0-preview-1`.
 - GitHub Actions artifacts: none retained
 
 The published CRX was independently validated by ExtensionInstaller's CRX3 inspector.
+
+
+## Network Recorder v1.7.0 capture profile
+
+The default capture profile is now size-conscious while retaining full network metadata:
+
+- API XHR/Fetch request and response bodies: enabled by default.
+- Textual page resources (HTML/JavaScript/CSS/etc.): enabled by default.
+- All binary resource bodies: disabled by default.
+- Download/blob byte capture: disabled by default; metadata remains recorded.
+- Deep diagnostics (IndexedDB, Cache Storage, MHTML, DOMSnapshot): disabled by default.
+- Chromium Tracing: disabled by default.
+- ZIP export uses DEFLATE for compressible entries and STORE for already-compressed binary formats.
+- JavaScript response bytes are stored once and referenced from the scripts manifest instead of duplicated.
+- Session manifests include archive size breakdown by category.
+
+All capture switches are available from the extension settings panel and apply to the next recording session.
