@@ -90,7 +90,8 @@ function isTextualResponse(info) {
   const mime = String(info?.mimeType || "").toLowerCase();
   const type = String(info?.type || "").toLowerCase();
   if (["document", "script", "stylesheet", "manifest", "texttrack"].includes(type)) return true;
-  if (mime.startsWith("text/")) return true;\n  return /(json|javascript|ecmascript|xml|svg|x-www-form-urlencoded)/i.test(mime);
+  if (mime.startsWith("text/")) return true;
+  return /(json|javascript|ecmascript|xml|svg|x-www-form-urlencoded)/i.test(mime);
 }
 
 function responseBodyPolicy(options, info) {
