@@ -1081,28 +1081,48 @@ function looksLikeDownloadResponse(params) {
 function rememberRequest(sessionId, source, params) {
   const url = params?.request?.url;
   if (!url || !params?.requestId) return;
-  recentRequestByUrl.set(`${source.tabId}|${url}`, {
+  recentRequestByUrl.set(String(source.tabId) + "|" + url, {
     sessionId,
     source: { tabId: source.tabId, sessionId: source?.sessionId || null },
     requestId: params.requestId,
     url,
     seenAt: Date.now()
+  });
+  const key = requestCaptureKey(sessionId, source, params.requestId);
+  const previous = requestCaptureInfo.get(key) || {};
+  requestCaptureInfo.set(key, {
+    ...previous,
+    type: params?.type || previous.type || null,
+    url,
+    method: params?.request?.method || previous.method || "",
+    mimeType: previous.mimeType || "",
+    status: previous.status ?? null
   });
 }
 
 function rememberResponseUrl(sessionId, source, params) {
   const url = params?.response?.url;
   if (!url || !params?.requestId) return;
-  recentRequestByUrl.set(`${source.tabId}|${url}`, {
+  recentRequestByUrl.set(String(source.tabId) + "|" + url, {
     sessionId,
     source: { tabId: source.tabId, sessionId: source?.sessionId || null },
     requestId: params.requestId,
     url,
     seenAt: Date.now()
   });
+  const key = requestCaptureKey(sessionId, source, params.requestId);
+  const previous = requestCaptureInfo.get(key) || {};
+  requestCaptureInfo.set(key, {
+    ...previous,
+    type: params?.type || previous.type || null,
+    url,
+    method: previous.method || "",
+    mimeType: params?.response?.mimeType || previous.mimeType || "",
+    status: params?.response?.status ?? previous.status ?? null
+  });
 }
 
-function findRecentRequest(tabId, url) {
+function findRecentRequestfunction findRecentRequest(tabId, url) {
   const item = recentRequestByUrl.get(`${tabId}|${url}`);
   if (!item) return null;
   if (Date.now() - item.seenAt > 60_000) {
@@ -1181,6 +1201,20 @@ async function startDownloadStream(sessionId, source, requestId, metadata = {}) 
   };
   await dbPut("downloads", record);
 
+  if (metadata.captureBytes === false) {
+    record.status = "metadata-only";
+    record.streamSupported = false;
+    record.streamError = "Byte capture disabled by Network Recorder settings.";
+    await dbPut("downloads", record);
+    await addRawEvent(sessionId, source, "Recorder.downloadBodySkipped", {
+      requestId,
+      url: record.url,
+      suggestedFilename: record.suggestedFilename,
+      reason: "files-and-blobs-disabled"
+    });
+    return record;
+  }
+
   try {
     const result = await debuggerCommand(targetForSource(source), "Network.streamResourceContent", { requestId });
     record.streamSupported = true;
@@ -1235,32 +1269,45 @@ function bodyKey(sessionId, source, requestId, kind) {
   return `${sessionId}|${child}|${requestId}|${kind}`;
 }
 
-async function captureCompletedBodies(sessionId, source, requestId) {
+async function captureCompletedBodies(sessionId, source, requestId, options, info) {
   const target = targetForSource(source);
+  const policy = responseBodyPolicy(options, info);
 
-  try {
-    const response = await debuggerCommand(target, "Network.getResponseBody", { requestId });
-    await dbPut("bodies", {
-      key: bodyKey(sessionId, source, requestId, "response"),
-      sessionId,
-      sourceSessionId: source?.sessionId || null,
+  if (policy.capture) {
+    try {
+      const response = await debuggerCommand(target, "Network.getResponseBody", { requestId });
+      await dbPut("bodies", {
+        key: bodyKey(sessionId, source, requestId, "response"),
+        sessionId,
+        sourceSessionId: source?.sessionId || null,
+        requestId,
+        kind: "response",
+        capturedAt: new Date().toISOString(),
+        base64Encoded: Boolean(response.base64Encoded),
+        body: response.body || ""
+      });
+    } catch (error) {
+      await addRawEvent(sessionId, source, "Recorder.responseBodyUnavailable", {
+        requestId,
+        error: error?.message || String(error)
+      });
+    }
+  } else {
+    await addRawEvent(sessionId, source, "Recorder.responseBodySkipped", {
       requestId,
-      kind: "response",
-      capturedAt: new Date().toISOString(),
-      base64Encoded: Boolean(response.base64Encoded),
-      body: response.body || ""
-    });
-  } catch (error) {
-    await addRawEvent(sessionId, source, "Recorder.responseBodyUnavailable", {
-      requestId,
-      error: error?.message || String(error)
+      url: info?.url || "",
+      type: info?.type || null,
+      mimeType: info?.mimeType || "",
+      reason: policy.reason
     });
   }
 
-  await captureRequestPostData(sessionId, source, requestId);
+  if (requestBodyPolicy(options, info)) {
+    await captureRequestPostData(sessionId, source, requestId);
+  }
 }
 
-async function startCapture(tabId, url, options = {}) {
+async function startCaptureasync function startCapture(tabId, url, options = {}) {
   if (!Number.isInteger(tabId)) {
     throw new Error("Не удалось определить вкладку браузера.");
   }
@@ -1449,7 +1496,8 @@ async function handleDebuggerEvent(source, method, params) {
       await enablePageEvents(child);
       await enableRuntimeLogPerformance(child);
       await enableAutoAttach(child);
-      await installBlobHook(child, sessionId, child);
+      const options = await getSessionCaptureOptions(sessionId);
+      if (options.filesAndBlobs) await installBlobHook(child, sessionId, child);
     } catch (error) {
       await addRawEvent(sessionId, child, "Recorder.childTargetCaptureError", {
         error: error?.message || String(error),
@@ -1472,6 +1520,8 @@ async function handleDebuggerEvent(source, method, params) {
   }
 
   if (method === "Runtime.bindingCalled" && params?.name === BLOB_BINDING) {
+    const options = await getSessionCaptureOptions(sessionId);
+    if (!options.filesAndBlobs) return;
     let payload = null;
     try { payload = JSON.parse(params.payload || "{}"); } catch (_) { payload = null; }
     if (!payload || typeof payload.kind !== "string") return;
@@ -1544,11 +1594,13 @@ async function handleDebuggerEvent(source, method, params) {
     await addRawEvent(sessionId, source, method, params || {});
     const recent = findRecentRequest(source.tabId, params?.url || "");
     if (recent && recent.sessionId === sessionId) {
+      const options = await getSessionCaptureOptions(sessionId);
       await startDownloadStream(sessionId, recent.source, recent.requestId, {
         url: params?.url || recent.url,
         suggestedFilename: params?.suggestedFilename || "",
         downloadGuid: params?.guid || null,
-        reason: "Page.downloadWillBegin"
+        reason: "Page.downloadWillBegin",
+        captureBytes: options.filesAndBlobs
       });
     } else {
       const key = `${sessionId}|page-download|${params?.guid || Date.now()}`;
@@ -1626,17 +1678,21 @@ async function handleDebuggerEvent(source, method, params) {
   if (method === "Network.responseReceived" && params?.requestId && looksLikeDownloadResponse(params)) {
     const response = params.response || {};
     const disposition = headerValue(response.headers, "content-disposition");
+    const options = await getSessionCaptureOptions(sessionId);
     await startDownloadStream(sessionId, source, params.requestId, {
       url: response.url || "",
       mimeType: response.mimeType || "",
       contentDisposition: disposition,
       suggestedFilename: filenameFromContentDisposition(disposition),
-      reason: "response-headers"
+      reason: "response-headers",
+      captureBytes: options.filesAndBlobs
     });
     return;
   }
 
   if (method === "Network.loadingFinished" && params?.requestId) {
+    const options = await getSessionCaptureOptions(sessionId);
+    const info = getRequestCaptureInfo(sessionId, source, params.requestId);
     const record = await dbGet("downloads", downloadKey(sessionId, source, params.requestId));
     if (record?.streamSupported) {
       await updateDownloadRecord(sessionId, source, params.requestId, {
@@ -1644,10 +1700,18 @@ async function handleDebuggerEvent(source, method, params) {
         finishedAt: new Date().toISOString(),
         encodedDataLength: params.encodedDataLength ?? null
       });
-      await captureRequestPostData(sessionId, source, params.requestId);
+      if (requestBodyPolicy(options, info)) await captureRequestPostData(sessionId, source, params.requestId);
     } else {
-      await captureCompletedBodies(sessionId, source, params.requestId);
+      if (record) {
+        await updateDownloadRecord(sessionId, source, params.requestId, {
+          status: record.status === "metadata-only" ? "metadata-only" : "network-complete",
+          finishedAt: new Date().toISOString(),
+          encodedDataLength: params.encodedDataLength ?? null
+        });
+      }
+      await captureCompletedBodies(sessionId, source, params.requestId, options, info);
     }
+    requestCaptureInfo.delete(requestCaptureKey(sessionId, source, params.requestId));
     return;
   }
 
