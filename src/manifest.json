@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Network Recorder",
-  "version": "1.6.0",
-  "description": "Records a high-fidelity browser tab session on any website: network traffic, bodies, downloads, cookies, storage, DOM/page snapshots, console/errors, user actions, resources, performance, optional Chromium Tracing and browser artifacts, then exports them to ZIP.",
+  "version": "1.7.0",
+  "description": "Records network metadata with selective API/text bodies by default, optional binary/deep diagnostics/Chromium Tracing, and exports a size-efficient compressed ZIP.",
   "permissions": [
     "storage",
     "debugger",
