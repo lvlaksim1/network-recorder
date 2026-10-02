@@ -532,10 +532,20 @@ function makeHar(session, requests) {
       bodySize: typeof requestBodyText === "string" ? encoder.encode(requestBodyText).length : -1
     };
     if (typeof requestBodyText === "string") {
-      harRequest.postData = {
-        mimeType: String(requestHeaders["content-type"] || requestHeaders["Content-Type"] || "application/octet-stream"),
-        text: requestBodyText
-      };
+      const requestBodyBytes = encoder.encode(requestBodyText).length;
+      if (requestBodyBytes <= 64 * 1024) {
+        harRequest.postData = {
+          mimeType: String(requestHeaders["content-type"] || requestHeaders["Content-Type"] || "application/octet-stream"),
+          text: requestBodyText
+        };
+      } else {
+        harRequest.postData = {
+          mimeType: String(requestHeaders["content-type"] || requestHeaders["Content-Type"] || "application/octet-stream"),
+          _bodyFile: item.requestBodyFile || null,
+          _byteLength: requestBodyBytes,
+          _textOmittedFromHar: true
+        };
+      }
     }
     if (item.requestBodyFile) harRequest._bodyFile = item.requestBodyFile;
 
@@ -730,15 +740,13 @@ async function exportSession(sessionId, tabId) {
       const type = String(item.type || "").toLowerCase();
       const isScript = type === "script" || /javascript|ecmascript/i.test(mime);
       if (isScript) {
-        const scriptName = filenameFromUrl(item.request?.url || "", `${baseIndex}.js`);
-        const scriptPath = `scripts/files/${baseIndex}-${scriptName.endsWith(".js") ? scriptName : `${scriptName}.js`}`;
-        zip.addFile(scriptPath, responseBytes);
         scriptManifest.push({
           sequence: item.sequence,
           url: item.request?.url || "",
           mimeType: mime,
-          file: scriptPath,
+          file: path,
           bodyFile: path,
+          storage: "shared-response-body",
           sha256: item.responseBodySha256
         });
       }
@@ -887,7 +895,22 @@ async function exportSession(sessionId, tabId) {
   }
   zip.addFile("blobs/manifest.json", jsonBytes(blobManifest));
 
-  const realtime = events.filter((event) => /^(Network\.(webSocket|eventSource|webTransport)|Recorder\.debuggerDetached)/.test(event.method));
+  const realtime = events
+    .filter((event) => /^(Network\.(webSocket|eventSource|webTransport)|Recorder\.debuggerDetached)/.test(event.method))
+    .map((event) => {
+      if (!/^Network\.webSocketFrame(Received|Sent)$/.test(event.method)) return event;
+      const copy = { ...event, params: { ...(event.params || {}) } };
+      if (copy.params.response && typeof copy.params.response.payloadData === "string") {
+        const payload = copy.params.response.payloadData;
+        copy.params.response = {
+          ...copy.params.response,
+          payloadCapturedInRawEvents: true,
+          payloadChars: payload.length
+        };
+        delete copy.params.response.payloadData;
+      }
+      return copy;
+    });
   const actions = events.filter((event) => event.method === "Recorder.userAction");
   const consoleEvents = events.filter((event) => event.method === "Runtime.consoleAPICalled" || event.method === "Log.entryAdded");
   const jsErrors = events.filter((event) => event.method === "Runtime.exceptionThrown" || event.method === "Runtime.exceptionRevoked");
@@ -1019,6 +1042,7 @@ async function exportSession(sessionId, tabId) {
       stopReason: session.stopReason,
       captureEngine: session.captureEngine,
       extensionVersion: session.extensionVersion,
+      captureOptions: session.captureOptions || null,
       chromiumTracing: session.tracing || { requested: false, status: "disabled" }
     },
     counts: {
@@ -1050,9 +1074,11 @@ async function exportSession(sessionId, tabId) {
       "raw-events.json is the primary event evidence stream. Derived files do not replace it.",
       "network.har, requests.json, actions.json, navigation.json, console.json and other summaries are derived views.",
       "Browser state is captured at start/end where possible: cookies, localStorage, sessionStorage, performance, screenshots and page HTML.",
-      "At session end the recorder also attempts IndexedDB, Cache Storage, storage quota, resource tree, MHTML and DOMSnapshot capture with explicit size/count limits.",
-      "HTTP response bodies are saved when Chromium exposes them. Missing bodies are explicitly represented by warnings/events rather than silently assumed present.",
-      "Downloads are captured through Network.streamResourceContent when possible. Blob URLs created by the page are independently streamed through a Runtime binding while recording.",
+      "Normal mode keeps full network metadata but captures bodies selectively: API XHR/Fetch plus textual page resources by default; large binary resource bodies are metadata-only unless explicitly enabled.",
+      "IndexedDB, Cache Storage, MHTML and DOMSnapshot are captured only when Deep diagnostics is enabled.",
+      "Download/blob bytes are captured only when Files and blob objects is enabled; download metadata is still retained when byte capture is disabled.",
+      "JavaScript response bytes are stored once under bodies/response and referenced by scripts/manifest.json instead of being duplicated.",
+      "ZIP uses DEFLATE for compressible text/JSON entries and STORE for already-compressed binary formats, with automatic STORE fallback if CompressionStream(deflate-raw) is unavailable.",
       "When Chromium Tracing is enabled in settings, the trace is requested with categories=* and record-as-much-as-possible, streamed through CDP IO, and saved as tracing/chromium-trace.json when available.",
       "Chromium Tracing can substantially increase browser load, IndexedDB usage and final ZIP size; session-manifest.json reports status, size and any known data loss.",
       "This archive may contain authentication tokens, cookies, form values, request/response bodies, downloaded files and other sensitive session data."
@@ -1066,12 +1092,15 @@ async function exportSession(sessionId, tabId) {
     delete copy._responseBody;
     return copy;
   });
-  zip.addFile("session-manifest.json", jsonBytes(manifest));
   zip.addFile("raw-events.json", jsonBytes(events));
   zip.addFile("requests.json", jsonBytes(requestsForExport));
   zip.addFile("network.har", jsonBytes(har));
 
-  const blob = zip.buildBlob();
+  await zip.preparePending();
+  manifest.archiveSizeBreakdown = zip.getStats();
+  zip.addFile("session-manifest.json", jsonBytes(manifest));
+
+  const blob = await zip.buildBlob();
   const filename = `Browser-Network-${filenameStamp(session.startTime)}.zip`;
   const token = `${sessionId}-${Math.random().toString(16).slice(2)}`;
   const blobUrl = URL.createObjectURL(blob);
