@@ -16,6 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate JavaScript syntax
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --check .\src\background.js
+          node --check .\src\content.js
+          node --check .\src\offscreen.js
+
       - name: Build and sign CRX3
         id: build
         shell: powershell
@@ -49,10 +57,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = "network-recorder-v1.6.0-preview-${{ github.run_number }}"
-          $title = "Network Recorder v1.6.0 preview ${{ github.run_number }}"
+          $version = '${{ steps.build.outputs.version }}'
+          $tag = "network-recorder-v$version-preview-${{ github.run_number }}"
+          $title = "Network Recorder v$version preview ${{ github.run_number }}"
           $notes = "Signed prerelease for ExtensionInstaller integration verification." + [Environment]::NewLine + [Environment]::NewLine +
-            "- Version: ${{ steps.build.outputs.version }}" + [Environment]::NewLine +
+            "- Version: $version" + [Environment]::NewLine +
             "- Extension ID: ${{ steps.build.outputs.extension_id }}" + [Environment]::NewLine +
             "- CRX SHA-256: ${{ steps.build.outputs.crx_sha256 }}" + [Environment]::NewLine +
             "- Signed in GitHub Actions from RSA_PRIVATE_KEY_BASE64" + [Environment]::NewLine +
