@@ -1654,6 +1654,21 @@ async function handleDebuggerEvent(source, method, params) {
     rememberResponseUrl(sessionId, source, params);
   }
 
+  let rawNetworkParams = params || {};
+  if (method === "Network.requestWillBeSent" && params?.request) {
+    const rawRequest = { ...params.request };
+    const hadInlinePostData = typeof rawRequest.postData === "string" || Array.isArray(rawRequest.postDataEntries);
+    if (hadInlinePostData) {
+      delete rawRequest.postData;
+      delete rawRequest.postDataEntries;
+      rawNetworkParams = {
+        ...params,
+        request: rawRequest,
+        requestBodyCapturedSeparately: true
+      };
+    }
+  }
+
   // streamResourceContent adds base64 payload to Network.dataReceived. The payload
   // is persisted separately in downloadChunks to avoid duplicating large binaries
   // inside raw-events.json; the raw timeline still keeps the event and byte counts.
@@ -1672,7 +1687,7 @@ async function handleDebuggerEvent(source, method, params) {
     delete rawParams.data;
     await addRawEvent(sessionId, source, method, rawParams);
   } else {
-    await addRawEvent(sessionId, source, method, params || {});
+    await addRawEvent(sessionId, source, method, rawNetworkParams);
   }
 
   if (method === "Network.responseReceived" && params?.requestId && looksLikeDownloadResponse(params)) {
