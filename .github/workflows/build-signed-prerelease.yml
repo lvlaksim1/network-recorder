@@ -21,8 +21,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           node --check .\src\background.js
+          if ($LASTEXITCODE -ne 0) { throw 'background.js syntax check failed.' }
           node --check .\src\content.js
+          if ($LASTEXITCODE -ne 0) { throw 'content.js syntax check failed.' }
           node --check .\src\offscreen.js
+          if ($LASTEXITCODE -ne 0) { throw 'offscreen.js syntax check failed.' }
 
       - name: Build and sign CRX3
         id: build
