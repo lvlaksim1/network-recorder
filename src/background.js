@@ -1122,7 +1122,7 @@ function rememberResponseUrl(sessionId, source, params) {
   });
 }
 
-function findRecentRequestfunction findRecentRequest(tabId, url) {
+function findRecentRequest(tabId, url) {
   const item = recentRequestByUrl.get(`${tabId}|${url}`);
   if (!item) return null;
   if (Date.now() - item.seenAt > 60_000) {
